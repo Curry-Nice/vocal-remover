@@ -1,8 +1,11 @@
 import io
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
 import zipfile
 from typing import Optional
@@ -13,12 +16,35 @@ from fastapi.responses import JSONResponse, StreamingResponse
 # 与前端约定一致：单文件上传最大 50MB
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="Demucs Separation Service", version="1.0.0")
 
 
 @app.get("/healthz")
 async def healthz() -> dict:
     return {"status": "ok"}
+
+
+def _estimate_processing_sec(file_size_bytes: int) -> tuple[float, str]:
+    """
+    根据文件大小粗估处理时间（启发式：约 1MB 对应 1 分钟音频，处理约 3–8 倍实时）。
+    返回 (预计秒数, 可读描述)。
+    """
+    size_mb = file_size_bytes / (1024 * 1024)
+    # 假设 1MB ≈ 0.5–1 分钟音频，处理时间约 5 倍实时
+    audio_min = max(0.1, size_mb * 0.8)
+    est_sec = audio_min * 60 * 5  # 约 5x 实时
+    if est_sec < 60:
+        desc = f"约 {int(est_sec)} 秒"
+    else:
+        desc = f"约 {est_sec / 60:.1f} 分钟"
+    return min(est_sec, 600), desc  # 上限 10 分钟
 
 
 def _build_demucs_command(
@@ -107,6 +133,19 @@ async def separate(
         with open(input_path, "wb") as f:
             shutil.copyfileobj(audio.file, f)
 
+        file_size = os.path.getsize(input_path)
+        est_sec, est_desc = _estimate_processing_sec(file_size)
+        filename = audio.filename or "input_audio"
+        logger.info(
+            "[%s] 收到音频 filename=%s size=%.2f MB model=%s stems=%s 预期处理时间 %s",
+            job_id,
+            filename,
+            file_size / (1024 * 1024),
+            model,
+            stems,
+            est_desc,
+        )
+
         try:
             cmd = _build_demucs_command(
                 input_path=input_path,
@@ -117,29 +156,61 @@ async def separate(
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
+        logger.info("[%s] 开始分离: %s", job_id, " ".join(cmd))
+        start_time = time.perf_counter()
+        stderr_lines: list[str] = []
+
+        def _log_stderr(stream: io.TextIOWrapper) -> None:
+            for line in iter(stream.readline, ""):
+                line = line.rstrip()
+                if line:
+                    stderr_lines.append(line)
+                    logger.info("[%s] demucs: %s", job_id, line)
+
         try:
-            completed = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                check=True,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=600,
             )
+            reader = threading.Thread(target=_log_stderr, args=(proc.stderr,))
+            reader.daemon = True
+            reader.start()
+            try:
+                proc.wait(timeout=600)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise
+            reader.join(timeout=2)
+            if proc.returncode != 0:
+                stderr_text = "\n".join(stderr_lines)[-2000:]
+                elapsed = time.perf_counter() - start_time
+                logger.warning(
+                    "[%s] 分离失败 returncode=%s 耗时 %.1fs",
+                    job_id,
+                    proc.returncode,
+                    elapsed,
+                )
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": "demucs_failed",
+                        "detail": stderr_text,
+                        "task_id": job_id,
+                    },
+                )
         except subprocess.TimeoutExpired as e:
+            elapsed = time.perf_counter() - start_time
+            logger.warning("[%s] 分离超时 耗时 %.1fs", job_id, elapsed)
             raise HTTPException(
                 status_code=504,
                 detail="Demucs processing timeout.",
             ) from e
-        except subprocess.CalledProcessError as e:
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "error": "demucs_failed",
-                    "detail": e.stderr[-2000:],
-                    "task_id": job_id,
-                },
-            )
+
+        elapsed = time.perf_counter() - start_time
+        logger.info("[%s] 分离完成 耗时 %.1f 秒", job_id, elapsed)
 
         # demucs 默认输出结构：<output_root>/<model>/<track_name>/*.wav
         track_name = os.path.splitext(os.path.basename(input_path))[0]
@@ -149,6 +220,13 @@ async def separate(
             stems_dir=stems_dir,
             stems=stems,
             task_id=job_id,
+        )
+        zip_size = len(zip_buffer.getvalue())
+        logger.info(
+            "[%s] 返回 zip %s 大小 %.2f MB",
+            job_id,
+            zip_name,
+            zip_size / (1024 * 1024),
         )
 
         headers = {

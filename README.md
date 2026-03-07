@@ -127,6 +127,7 @@ else:
 | 成功响应 | `Content-Type: application/zip`，直接写为文件即可。 |
 | 失败响应 | `Content-Type: application/json`，含 `error`、`detail`、`task_id`，便于排查。 |
 | 同机调用 | 业务与本品同机部署时，可直接用 `http://127.0.0.1:8001`，无需暴露公网。 |
+| 处理记录 | 每次收到音频会打日志：任务 ID、文件名、大小、预期处理时间；分离过程中 demucs 进度会实时打到 stdout；结束时输出实际耗时与 zip 大小。查看容器或进程 stdout 即可看到处理过程。 |
 
 **上传被拒（“File too large” / 413）**：多数是**反向代理或 BFF 的请求体上限**小于 50MB。  
 - **Nginx**：在 `server` 或 `location` 中设置 `client_max_body_size 50m;` 后重载配置。  
@@ -147,6 +148,37 @@ pip install "git+https://github.com/adefossez/demucs.git"
 
 uvicorn main:app --host 0.0.0.0 --port 8001
 ```
+
+---
+
+## 如何验证服务是否可正常交互
+
+服务启动后，可用下面两种方式确认能正常访问和人声分离。
+
+**1. 健康检查（curl）**
+
+```bash
+curl http://127.0.0.1:8001/healthz
+# 期望: {"status":"ok"}
+```
+
+**2. 冒烟测试（推荐）**
+
+仓库内自带脚本 `demucs_service/smoke_test.py`，会请求 `/healthz` 并上传一段极短 WAV 到 `/api/v1/separate`，校验返回为 zip。**仅用 Python 标准库，无需额外依赖。**
+
+```bash
+# 先在一个终端启动服务（见上方「本地开发」）
+cd demucs_service
+uvicorn main:app --host 0.0.0.0 --port 8001
+
+# 在另一个终端执行
+cd demucs_service
+python smoke_test.py
+# 可选：指定服务地址
+python smoke_test.py http://127.0.0.1:8001
+```
+
+若输出包含「全部通过，服务可正常交互。」即表示健康检查与人声分离接口均可成功交互。若分离步骤报错，请确认已安装 demucs（`pip install "git+https://github.com/adefossez/demucs.git"`）。
 
 ---
 
