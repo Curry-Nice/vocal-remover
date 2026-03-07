@@ -7,8 +7,11 @@ import uuid
 import zipfile
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
+
+# 与前端约定一致：单文件上传最大 50MB
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB
 
 app = FastAPI(title="Demucs Separation Service", version="1.0.0")
 
@@ -74,12 +77,26 @@ def _make_zip_from_stems(
 
 
 @app.post("/api/v1/separate")
+@app.post("/separate")
 async def separate(
+    request: Request,
     audio: UploadFile = File(...),
     model: str = Form("htdemucs"),
     stems: int = Form(2),
     task_id: Optional[str] = Form(None),
 ):
+    # 若代理未限制，在此统一限制请求体大小，与前端 50MB 一致
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="File too large for the separation service (server limit). Try a smaller or shorter file.",
+                )
+        except ValueError:
+            pass  # 无效 content-length 时继续，由后续逻辑处理
+
     job_id = task_id or str(uuid.uuid4())
     job_dir = tempfile.mkdtemp(prefix=f"demucs_job_{job_id}_")
     input_path = os.path.join(job_dir, audio.filename or "input_audio")
