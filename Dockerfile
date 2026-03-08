@@ -19,6 +19,11 @@ RUN pip install -r requirements.txt
 RUN git clone https://github.com/adefossez/demucs.git /app/demucs \
     && pip install -e /app/demucs
 
+# 固化运行时依赖，避免线上反复出现：
+# 1) RuntimeError: Numpy is not available
+# 2) TorchCodec is required for torchaudio save
+RUN pip install --no-cache-dir "numpy<2" torchcodec
+
 # 拷贝服务代码
 COPY demucs_service/ /app/
 
