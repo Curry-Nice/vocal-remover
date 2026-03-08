@@ -3,6 +3,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -15,13 +16,20 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 # 与前端约定一致：单文件上传最大 50MB
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB
+DEFAULT_DEMUCS_CACHE_ROOT = "/tmp/demucs-cache"
+DEFAULT_OUTPUT_BITRATE = "128k"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+# 保证在 uvicorn 下也能看到应用日志：给本模块 logger 单独加 stdout 处理器
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setLevel(logging.INFO)
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    logger.addHandler(_handler)
+logger.propagate = False  # 不交给 root，避免被 uvicorn 的配置盖住
 
 app = FastAPI(title="Demucs Separation Service", version="1.0.0")
 
@@ -58,7 +66,7 @@ def _build_demucs_command(
 
     # demucs CLI: python -m demucs -n <model> [--two-stems vocals] -o <outdir> <audio>
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "demucs",
         "-n",
@@ -83,19 +91,44 @@ def _make_zip_from_stems(
     if not os.path.isdir(stems_dir):
         raise FileNotFoundError(f"Stems directory not found: {stems_dir}")
 
+    def _wav_to_mp3(src_wav: str, dst_mp3: str) -> None:
+        # 统一转 mp3，显著减小返回包体积，降低公网下载耗时
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                src_wav,
+                "-vn",
+                "-codec:a",
+                "libmp3lame",
+                "-b:a",
+                os.getenv("DEMUCS_OUTPUT_BITRATE", DEFAULT_OUTPUT_BITRATE),
+                dst_mp3,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if proc.returncode != 0:
+            stderr_text = (proc.stderr or "")[-1200:]
+            raise RuntimeError(f"ffmpeg convert failed: {stderr_text}")
+
     zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name in os.listdir(stems_dir):
-            if not name.lower().endswith(".wav"):
-                continue
-            src = os.path.join(stems_dir, name)
-            arcname = name
+    with tempfile.TemporaryDirectory(prefix="demucs_mp3_") as convert_dir:
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name in os.listdir(stems_dir):
+                if not name.lower().endswith(".wav"):
+                    continue
 
-            # 两轨时把 no_vocals.wav 重命名为 accompaniment.wav
-            if stems == 2 and name == "no_vocals.wav":
-                arcname = "accompaniment.wav"
+                src = os.path.join(stems_dir, name)
+                stem_name = os.path.splitext(name)[0]
+                if stems == 2 and stem_name == "no_vocals":
+                    stem_name = "accompaniment"
 
-            zf.write(src, arcname)
+                dst_mp3 = os.path.join(convert_dir, f"{stem_name}.mp3")
+                _wav_to_mp3(src, dst_mp3)
+                zf.write(dst_mp3, f"{stem_name}.mp3")
 
     zip_buffer.seek(0)
     zip_name = f"{task_id or 'separation'}_stems.zip"
@@ -124,6 +157,7 @@ async def separate(
             pass  # 无效 content-length 时继续，由后续逻辑处理
 
     job_id = task_id or str(uuid.uuid4())
+    logger.info("[%s] 收到分离请求 filename=%s", job_id, audio.filename or "(未提供)")
     job_dir = tempfile.mkdtemp(prefix=f"demucs_job_{job_id}_")
     input_path = os.path.join(job_dir, audio.filename or "input_audio")
     output_root = os.path.join(job_dir, "output")
@@ -159,6 +193,10 @@ async def separate(
         logger.info("[%s] 开始分离: %s", job_id, " ".join(cmd))
         start_time = time.perf_counter()
         stderr_lines: list[str] = []
+        cache_root = os.getenv("DEMUCS_CACHE_ROOT", DEFAULT_DEMUCS_CACHE_ROOT)
+        cache_root = os.path.abspath(cache_root)
+        torch_home = os.path.join(cache_root, "torch")
+        os.makedirs(torch_home, exist_ok=True)
 
         def _log_stderr(stream: io.TextIOWrapper) -> None:
             for line in iter(stream.readline, ""):
@@ -168,11 +206,16 @@ async def separate(
                     logger.info("[%s] demucs: %s", job_id, line)
 
         try:
+            demucs_env = os.environ.copy()
+            # 某些部署环境（容器/受限用户）默认 HOME 不可写，显式改到可写缓存目录。
+            demucs_env.setdefault("XDG_CACHE_HOME", cache_root)
+            demucs_env.setdefault("TORCH_HOME", torch_home)
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
+                env=demucs_env,
             )
             reader = threading.Thread(target=_log_stderr, args=(proc.stderr,))
             reader.daemon = True
